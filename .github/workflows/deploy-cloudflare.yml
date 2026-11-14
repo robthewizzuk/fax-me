@@ -33,6 +33,9 @@ jobs:
       - name: Run ITU-T T.38 UDPTL protocol tests
         run: npm run test:t38
 
+      - name: Install FFmpeg for SIP codec tests
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Run SIP/RTP G.711/G.722/G.729 codec tests
         run: npm run test:sip
 
