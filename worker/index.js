@@ -538,6 +538,9 @@ export class RetroFaxHub extends DurableObject {
       this.broadcastDirectory();
     }
 
+    let rxNotifiedRinging = false;
+    let botCallbackPayload = null;
+
     try {
       const fromLabel = callerSession.display_name
         ? `${callerSession.display_name} (${callerSession.display_number})`
@@ -557,7 +560,6 @@ export class RetroFaxHub extends DurableObject {
         faxPages.push(withTti);
       }
 
-      let rxNotifiedRinging = false;
       let rxNotifiedHandshake = false;
 
       const result = await executeT38TransmissionEdge({
@@ -613,7 +615,19 @@ export class RetroFaxHub extends DurableObject {
           txId,
           event: { type: 'tx_failed', reason: result.status, report: result.report, logs: result.logs },
         });
-        return;
+        if (targetSession && rxNotifiedRinging) {
+          this.sendWsToSession(targetSession.id, {
+            type: 'rx_event',
+            rxId: txId,
+            event: { type: 'rx_failed', reason: result.status },
+          });
+        }
+        return {
+          status: result.status,
+          targetNumber: targetDisplayNumber,
+          report: result.report,
+          logs: result.logs,
+        };
       }
 
       const saved = await this.persistCompletedFax({
@@ -631,18 +645,20 @@ export class RetroFaxHub extends DurableObject {
       });
 
       this.ctx.storage.sql.exec('DELETE FROM staged_docs WHERE id = ?', stageId);
+
+      const txCompleteEvent = {
+        type: 'tx_complete',
+        faxId: saved.faxId,
+        report: saved.report,
+        tiffUrl: saved.tiffUrl,
+        pcapUrl: saved.pcapUrl,
+        previewUrls: saved.previewUrls,
+        logs: saved.logs,
+      };
       this.sendWsToSession(callerSession.id, {
         type: 'tx_event',
         txId,
-        event: {
-          type: 'tx_complete',
-          faxId: saved.faxId,
-          report: saved.report,
-          tiffUrl: saved.tiffUrl,
-          pcapUrl: saved.pcapUrl,
-          previewUrls: saved.previewUrls,
-          logs: saved.logs,
-        },
+        event: txCompleteEvent,
       });
 
       if (targetSession) {
@@ -671,18 +687,51 @@ export class RetroFaxHub extends DurableObject {
       }
 
       if (resolved.kind === 'bot') {
-        await new Promise((r) => setTimeout(r, 900));
-        await this.triggerBotCallback({
+        botCallbackPayload = {
           bot: resolved.bot,
           targetSession: callerSession,
           receivedPages: result.receivedPages,
           fine,
+        };
+      }
+
+      return {
+        status: 'ok',
+        targetNumber: targetDisplayNumber,
+        fax: txCompleteEvent,
+      };
+    } catch (err) {
+      this.sendWsToSession(callerSession.id, {
+        type: 'tx_event',
+        txId,
+        event: { type: 'error', error: err.message },
+      });
+      if (targetSession && rxNotifiedRinging) {
+        this.sendWsToSession(targetSession.id, {
+          type: 'rx_event',
+          rxId: txId,
+          event: { type: 'rx_failed', reason: 'error', error: err.message },
         });
       }
+      return {
+        status: 'error',
+        error: err.message,
+      };
     } finally {
       this.busySessions.delete(callerSession.id);
       if (targetSession) this.busySessions.delete(targetSession.id);
       this.broadcastDirectory();
+      if (botCallbackPayload) {
+        const cbPayload = botCallbackPayload;
+        this.ctx.waitUntil(
+          (async () => {
+            await new Promise((r) => setTimeout(r, 900));
+            await this.triggerBotCallback(cbPayload);
+          })().catch((err) => {
+            console.error('Bot callback error:', err);
+          })
+        );
+      }
     }
   }
 
@@ -691,6 +740,7 @@ export class RetroFaxHub extends DurableObject {
     this.busySessions.add(targetSession.id);
     this.broadcastDirectory();
     const rxId = crypto.randomUUID();
+    let notifiedRing = false;
 
     try {
       const replyRawPages = await generateBotReplyFaxPagesEdge(bot.id, {
@@ -710,7 +760,6 @@ export class RetroFaxHub extends DurableObject {
         })
       );
 
-      let notifiedRing = false;
       let notifiedHandshake = false;
       const result = await executeT38TransmissionEdge({
         fromNumber: bot.display_number,
@@ -752,7 +801,16 @@ export class RetroFaxHub extends DurableObject {
         },
       });
 
-      if (result.status !== 'ok') return;
+      if (result.status !== 'ok') {
+        if (notifiedRing) {
+          this.sendWsToSession(targetSession.id, {
+            type: 'rx_event',
+            rxId,
+            event: { type: 'rx_failed', reason: result.status },
+          });
+        }
+        return;
+      }
 
       const saved = await this.persistCompletedFax({
         fromSession: null,
@@ -790,6 +848,14 @@ export class RetroFaxHub extends DurableObject {
           },
         },
       });
+    } catch (err) {
+      if (notifiedRing) {
+        this.sendWsToSession(targetSession.id, {
+          type: 'rx_event',
+          rxId,
+          event: { type: 'rx_failed', reason: 'error', error: err.message },
+        });
+      }
     } finally {
       this.busySessions.delete(targetSession.id);
       this.broadcastDirectory();
@@ -839,12 +905,18 @@ export class RetroFaxHub extends DurableObject {
       });
 
       if (result.status !== 'ok') {
+        const failEvent = {
+          type: 'call_tx_failed',
+          reason: result.status,
+          report: result.report,
+          logs: result.logs,
+        };
         this.sendWsToSession(callerSession.id, {
           type: 'call_tx_event',
           callTxId,
-          event: { type: 'call_tx_failed', reason: result.status, report: result.report, logs: result.logs },
+          event: failEvent,
         });
-        return;
+        return { status: result.status, targetNumber: targetDisplayNumber, report: result.report, logs: result.logs };
       }
 
       const saved = this.persistCompletedCall({
@@ -862,23 +934,33 @@ export class RetroFaxHub extends DurableObject {
         report: result.report,
       });
 
+      const completeEvent = {
+        type: 'call_tx_complete',
+        callId: saved.callId,
+        codec,
+        fromNumber: callerSession.display_number,
+        toNumber: targetDisplayNumber,
+        report: saved.report,
+        callerWavUrl: saved.callerWavUrl,
+        replyWavUrl: saved.replyWavUrl,
+        pcapUrl: saved.pcapUrl,
+        logs: saved.logs,
+        createdAt: Date.now(),
+      };
       this.sendWsToSession(callerSession.id, {
         type: 'call_tx_event',
         callTxId,
-        event: {
-          type: 'call_tx_complete',
-          callId: saved.callId,
-          codec,
-          fromNumber: callerSession.display_number,
-          toNumber: targetDisplayNumber,
-          report: saved.report,
-          callerWavUrl: saved.callerWavUrl,
-          replyWavUrl: saved.replyWavUrl,
-          pcapUrl: saved.pcapUrl,
-          logs: saved.logs,
-          createdAt: Date.now(),
-        },
+        event: completeEvent,
       });
+
+      return { status: 'ok', targetNumber: targetDisplayNumber, call: completeEvent };
+    } catch (err) {
+      this.sendWsToSession(callerSession.id, {
+        type: 'call_tx_event',
+        callTxId,
+        event: { type: 'error', error: err.message },
+      });
+      return { status: 'error', error: err.message };
     } finally {
       this.busySessions.delete(callerSession.id);
       this.broadcastDirectory();
@@ -1487,26 +1569,22 @@ export class RetroFaxHub extends DurableObject {
       }
 
       const txId = crypto.randomUUID();
-      this.ctx.waitUntil(
-        this.runTransmissionJob({
-          txId,
-          stageId,
-          callerSession: session,
-          staged: { ...staged, rawPagePngsB64: sendPagesB64 },
-          resolved,
-          rawDialed: toNumber,
-          fine: Boolean(fine),
-          stormyLine: Boolean(stormyLine),
-        }).catch((err) => {
-          this.sendWsToSession(session.id, {
-            type: 'tx_event',
-            txId,
-            event: { type: 'error', error: err.message },
-          });
-        })
-      );
+      const jobResult = await this.runTransmissionJob({
+        txId,
+        stageId,
+        callerSession: session,
+        staged: { ...staged, rawPagePngsB64: sendPagesB64 },
+        resolved,
+        rawDialed: toNumber,
+        fine: Boolean(fine),
+        stormyLine: Boolean(stormyLine),
+      });
 
-      return jsonResponse({ ok: true, txId, targetNumber: toNumber }, 200, setHeaders);
+      if (jobResult.status === 'error') {
+        return jsonResponse({ error: jobResult.error || 'T.38 transmission failed', txId }, 500, setHeaders);
+      }
+
+      return jsonResponse({ ok: true, txId, targetNumber: toNumber, ...jobResult }, 200, setHeaders);
     }
 
     if (method === 'POST' && pathname === '/api/call') {
@@ -1541,25 +1619,21 @@ export class RetroFaxHub extends DurableObject {
       }
 
       const callTxId = crypto.randomUUID();
-      this.ctx.waitUntil(
-        this.runSipBotCallJob({
-          callTxId,
-          callerSession: session,
-          resolved,
-          rawDialed: toNumber,
-          codec,
-          ttsText,
-          stormyLine,
-        }).catch((err) => {
-          this.sendWsToSession(session.id, {
-            type: 'call_tx_event',
-            callTxId,
-            event: { type: 'error', error: err.message },
-          });
-        })
-      );
+      const jobResult = await this.runSipBotCallJob({
+        callTxId,
+        callerSession: session,
+        resolved,
+        rawDialed: toNumber,
+        codec,
+        ttsText,
+        stormyLine,
+      });
 
-      return jsonResponse({ ok: true, callTxId, codec, targetNumber: toNumber }, 200, setHeaders);
+      if (jobResult.status === 'error') {
+        return jsonResponse({ error: jobResult.error || 'SIP call failed', callTxId, codec }, 500, setHeaders);
+      }
+
+      return jsonResponse({ ok: true, callTxId, codec, targetNumber: toNumber, ...jobResult }, 200, setHeaders);
     }
 
     // Fax Artifacts & Metadata

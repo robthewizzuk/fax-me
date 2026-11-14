@@ -116,6 +116,8 @@ export default function App() {
   const liveSipLogsRef = useRef([]);
   const wsRef = useRef(null);
   const pendingBotCallRef = useRef(null);
+  const handledTxIdsRef = useRef(new Set());
+  const handledCallTxIdsRef = useRef(new Set());
 
   const showToast = useCallback((text, action = null) => {
     setToast({ text, action, id: Date.now() });
@@ -145,7 +147,7 @@ export default function App() {
       });
   }, []);
 
-  const handleTxEvent = useCallback((ev) => {
+  const handleTxEvent = useCallback((ev, txId = null) => {
     if (ev.type === 't38_log') {
       setWireMode('t38');
       setT38Logs((prev) => [...prev.slice(-220), ev.entry]);
@@ -172,6 +174,10 @@ export default function App() {
         udptlPackets: ev.udptlPackets,
       }));
     } else if (ev.type === 'tx_failed') {
+      if (txId) {
+        if (handledTxIdsRef.current.has(txId)) return;
+        handledTxIdsRef.current.add(txId);
+      }
       setTxState({ active: false, phase: ev.reason === 'busy' ? 'BUSY' : 'NO_ANSWER', progress: 0, detail: '', udptlPackets: 0 });
       if (ev.reason === 'busy') {
         faxAudio.playBusySignal();
@@ -183,6 +189,10 @@ export default function App() {
         showToast('Ring No Answer — Recipient fax machine is offline (SIP 480)');
       }
     } else if (ev.type === 'tx_complete') {
+      if (txId) {
+        if (handledTxIdsRef.current.has(txId)) return;
+        handledTxIdsRef.current.add(txId);
+      }
       faxAudio.playConfirmBeep();
       setTxState({ active: false, phase: 'COMPLETED', progress: 1, detail: 'MCF CONFIRMED', udptlPackets: ev.report?.udptlPackets || 0 });
       setStaged(null);
@@ -205,6 +215,10 @@ export default function App() {
         },
       });
     } else if (ev.type === 'error') {
+      if (txId) {
+        if (handledTxIdsRef.current.has(txId)) return;
+        handledTxIdsRef.current.add(txId);
+      }
       faxAudio.playBuzzerError();
       setTxState({ active: false, phase: 'ERROR', progress: 0, detail: '', udptlPackets: 0 });
       setAlertBanner({ line1: 'TRANSMISSION ERROR', line2: (ev.error || '').slice(0, 30) });
@@ -219,6 +233,7 @@ export default function App() {
         setT38Logs((prev) => [...prev.slice(-220), ev.entry]);
       }
     } else if (ev.type === 'incoming_ring') {
+      if (!txStateRef.current?.active) setWireMode('t38');
       faxAudio.playIncomingMachineRing();
       setRxState({ active: true, fromNumber: ev.fromNumber, fromName: ev.fromName, progress: 0.04 });
       showToast(`Incoming T.38 Fax from ${ev.fromName || ev.fromNumber}!`);
@@ -231,6 +246,10 @@ export default function App() {
         active: true,
         progress: Math.max(0.1, ev.overallProgress || 0.1),
       }));
+    } else if (ev.type === 'rx_failed') {
+      faxAudio.playBuzzerError();
+      setRxState({ active: false, fromNumber: '', fromName: '', progress: 0 });
+      showToast(ev.error || 'Incoming T.38 fax interrupted');
     } else if (ev.type === 'rx_complete') {
       faxAudio.playConfirmBeep();
       setRxState({ active: false, fromNumber: '', fromName: '', progress: 0 });
@@ -246,7 +265,7 @@ export default function App() {
     }
   }, [showToast]);
 
-  const handleCallTxEvent = useCallback((ev) => {
+  const handleCallTxEvent = useCallback((ev, callTxId = null) => {
     if (ev.type === 't38_log') {
       setWireMode('sip');
       setT38Logs((prev) => [...prev.slice(-220), ev.entry]);
@@ -273,6 +292,10 @@ export default function App() {
         rtpPackets: ev.rtpPackets,
       }));
     } else if (ev.type === 'call_tx_failed') {
+      if (callTxId) {
+        if (handledCallTxIdsRef.current.has(callTxId)) return;
+        handledCallTxIdsRef.current.add(callTxId);
+      }
       setCallState({
         active: false,
         phase: ev.reason === 'busy' ? 'BUSY' : 'NO_ANSWER',
@@ -291,6 +314,10 @@ export default function App() {
         showToast('Ring No Answer — Target station offline (SIP 480)');
       }
     } else if (ev.type === 'call_tx_complete') {
+      if (callTxId) {
+        if (handledCallTxIdsRef.current.has(callTxId)) return;
+        handledCallTxIdsRef.current.add(callTxId);
+      }
       faxAudio.playConfirmBeep();
       setCallState({
         active: false,
@@ -328,6 +355,10 @@ export default function App() {
         }
       );
     } else if (ev.type === 'error') {
+      if (callTxId) {
+        if (handledCallTxIdsRef.current.has(callTxId)) return;
+        handledCallTxIdsRef.current.add(callTxId);
+      }
       faxAudio.playBuzzerError();
       setCallState({ active: false, phase: 'ERROR', progress: 0, detail: '', rtpPackets: 0, targetNumber: '' });
       setAlertBanner({ line1: 'SIP CALL ERROR', line2: (ev.error || '').slice(0, 30) });
@@ -437,13 +468,22 @@ export default function App() {
         setCallState({ active: false, phase: 'IDLE', progress: 0, detail: '', rtpPackets: 0, targetNumber: '' });
         faxAudio.playBuzzerError();
         showToast(data.error || 'SIP call failed');
+      } else if (data.callTxId && !handledCallTxIdsRef.current.has(data.callTxId)) {
+        if (data.status === 'ok' && data.call) {
+          handleCallTxEvent(data.call, data.callTxId);
+        } else if (data.status === 'busy' || data.status === 'no_answer') {
+          handleCallTxEvent(
+            { type: 'call_tx_failed', reason: data.status, report: data.report, logs: data.logs },
+            data.callTxId
+          );
+        }
       }
     } catch (err) {
       setCallState({ active: false, phase: 'IDLE', progress: 0, detail: '', rtpPackets: 0, targetNumber: '' });
       faxAudio.playBuzzerError();
       showToast(err.message);
     }
-  }, [showToast]);
+  }, [showToast, handleCallTxEvent]);
 
   // 2. WebSocket Connection for Live T.38 & Live Duplex SIP+RTP Telemetry
   useEffect(() => {
@@ -451,6 +491,7 @@ export default function App() {
     let ws;
     let dead = false;
     let reconnectTimer;
+    let hasOpenedOnce = false;
 
     const connect = () => {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -458,7 +499,22 @@ export default function App() {
       ws = new WebSocket(url);
       wsRef.current = ws;
 
-      ws.onopen = () => setWsConnected(true);
+      ws.onopen = () => {
+        setWsConnected(true);
+        if (hasOpenedOnce) {
+          const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          fetch(`/api/session?tz=${encodeURIComponent(tz)}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => {
+              if (!data || dead) return;
+              if (data.directory) setDirectory(data.directory);
+              if (data.inbox) setInbox(data.inbox);
+              if (data.calls) setCallsInbox(data.calls);
+            })
+            .catch(() => {});
+        }
+        hasOpenedOnce = true;
+      };
       ws.onclose = () => {
         setWsConnected(false);
         if (wsRef.current === ws) wsRef.current = null;
@@ -471,11 +527,11 @@ export default function App() {
           if (data.type === 'directory_update') {
             setDirectory(data.directory || []);
           } else if (data.type === 'tx_event') {
-            handleTxEvent(data.event);
+            handleTxEvent(data.event, data.txId);
           } else if (data.type === 'rx_event') {
             handleRxEvent(data.event);
           } else if (data.type === 'call_tx_event') {
-            handleCallTxEvent(data.event);
+            handleCallTxEvent(data.event, data.callTxId);
           } else if (data.type === 'call_rx_event') {
             handleCallRxEvent(data.event);
           } else if (data.type === 'live_call_use_bot') {
@@ -763,12 +819,21 @@ export default function App() {
         setTxState({ active: false, phase: 'IDLE', progress: 0, detail: '', udptlPackets: 0 });
         faxAudio.playBuzzerError();
         showToast(data.error || 'Failed to send fax');
+      } else if (data.txId && !handledTxIdsRef.current.has(data.txId)) {
+        if (data.status === 'ok' && data.fax) {
+          handleTxEvent(data.fax, data.txId);
+        } else if (data.status === 'busy' || data.status === 'no_answer') {
+          handleTxEvent(
+            { type: 'tx_failed', reason: data.status, report: data.report, logs: data.logs },
+            data.txId
+          );
+        }
       }
     } catch (err) {
       setTxState({ active: false, phase: 'IDLE', progress: 0, detail: '', udptlPackets: 0 });
       showToast(err.message);
     }
-  }, [dialNumber, staged, fine, stormyLine, coverEnabled, showToast]);
+  }, [dialNumber, staged, fine, stormyLine, coverEnabled, showToast, handleTxEvent]);
 
   const handlePlaceSipCall = useCallback(async ({
     toNumber = null,
