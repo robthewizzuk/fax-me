@@ -1,0 +1,47 @@
+name: Deploy RetroFax to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    name: Build, Protocol Test & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install backend & shared dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix client ci
+
+      - name: Run ITU-T T.38 UDPTL protocol tests
+        run: npm run test:t38
+
+      - name: Run SIP/RTP G.711/G.722/G.729 codec tests
+        run: npm run test:sip
+
+      - name: Build React + Three.js bundle
+        run: npm run build
+
+      - name: Deploy Worker & Assets to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "3"

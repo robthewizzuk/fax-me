@@ -1,0 +1,28 @@
+{
+  "name": "retrofax-t38",
+  "version": "1.0.0",
+  "description": "1990s 3D Fax Machine powered by real ITU-T T.38 UDPTL over IP",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "dev:server": "node --watch server/index.js",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "start": "NODE_ENV=production node server/index.js",
+    "test:t38": "node server/t38/test-t38.js",
+    "test:sip": "node server/sip/test-sip.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2",
+    "fast-xml-parser": "^4.5.3",
+    "geoip-lite": "^1.4.10",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.33.5",
+    "uuid": "^11.0.5",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
+  }
+}
